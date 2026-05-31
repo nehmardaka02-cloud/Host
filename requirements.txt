@@ -1,0 +1,10 @@
+protobuf
+protobuf_decoder
+psutil
+pycryptodome
+PyJWT
+Requests
+Crypto==1.2.1
+python-telegram-bot>=20.0
+flask
+psutil
