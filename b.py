@@ -1,1332 +1,1336 @@
 """
-=============================================================
-  Telegram Bot Hosting Platform
-  Requirements: python-telegram-bot>=20.0, flask, psutil
-  Run: pip install python-telegram-bot flask psutil
-       python main.py
-=============================================================
+بوت تليجرام لاستضافة APIs وملفات HTML
+======================================
+المتطلبات:
+    pip install python-telegram-bot[webhooks]>=20.0 flask psutil aiofiles aiohttp
+
+الإعداد:
+    1. غيّر BOT_TOKEN بتوكن البوت من BotFather
+    2. غيّر OWNER_ID بمعرفك الرقمي
+    3. غيّر BASE_URL برابط سيرفرك (مثل http://your-domain.com)
+    4. غيّر HOST_PORT إذا أردت منفذاً مختلفاً لخادم الملفات
 """
 
-import os
-import sys
+import asyncio
+import hashlib
 import json
-import time
+import logging
+import os
+import random
+import re
 import shutil
 import signal
-import logging
-import zipfile
-import asyncio
-import threading
+import sqlite3
+import string
 import subprocess
-from pathlib import Path
+import sys
+import threading
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 
 import psutil
-from flask import Flask, send_file, abort, jsonify
+from flask import Flask, Response, abort, request, send_from_directory
 from telegram import (
-    Update,
+    Bot,
+    CallbackQuery,
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    BotCommand,
+    Update,
 )
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION  (edit before running)
-# ─────────────────────────────────────────────
-BOT_TOKEN      = "8791101593:AAEbW3M77kiiL5NghFICpl0iDInpVKh0VwY"          # BotFather token
-OWNER_ID       = 8487397448                       # Your Telegram user ID (int)
-SERVER_HOST    = "https://host-masjon.onrender.com"        # Public URL of this machine
-FLASK_PORT     = 5000
-FLASK_HOST     = "0.0.0.0"
+# ═══════════════════════════════════════════
+#   الإعدادات الرئيسية — غيّرها قبل التشغيل
+# ═══════════════════════════════════════════
+BOT_TOKEN = "8791101593:AAEbW3M77kiiL5NghFICpl0iDInpVKh0VwY"
+OWNER_ID = 8487397448          # معرفك الرقمي
+BASE_URL = "https://host-masjon.onrender.com"  # رابط السيرفر بدون / في النهاية
+HOST = "0.0.0.0"
+HOST_PORT = 8080               # منفذ خادم الملفات
+API_PORT_START = 9000          # أول منفذ للـ APIs الديناميكية
+API_PORT_END = 9999            # آخر منفذ للـ APIs الديناميكية
+MAX_PROJECTS_FREE = 2          # أقصى مشاريع للمستخدم العادي
+MAX_PROJECTS_VIP = 10          # أقصى مشاريع لـ VIP
+RATE_LIMIT_PER_MINUTE = 30     # أقصى طلبات في الدقيقة
+WATCHDOG_INTERVAL = 30         # ثانية بين كل فحص للـ watchdog
+MANDATORY_CHANNELS = []        # أضف قنوات إجبارية: ["@channel1", "@channel2"]
 
-MAX_STORAGE_MB = 500        # Per-user storage limit in MB
-MAX_BOTS_USER  = 10         # Max bots per user
-PORT_RANGE_START = 6000     # Dynamic port allocation start
-PORT_RANGE_END   = 7000
+# ═══════════════════════════════════════════
+#   المسارات
+# ═══════════════════════════════════════════
+BASE_DIR = Path(__file__).parent
+PROJECTS_DIR = BASE_DIR / "projects"
+DB_PATH = BASE_DIR / "bot_data.db"
+LOGS_DIR = BASE_DIR / "logs"
 
-# Dangerous shell patterns to block
-BLOCKED_PATTERNS = [
-    "rm -rf", "rm -r /", "mkfs", ":(){:|:&}", "dd if=/dev/zero",
-    "chmod -R 777 /", "> /dev/sda", "wget | sh", "curl | sh",
-    "sudo rm", "sudo dd", "format c:",
-]
+PROJECTS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────
-#  DIRECTORY STRUCTURE
-# ─────────────────────────────────────────────
-BASE_DIR  = Path(__file__).parent
-BOTS_DIR  = BASE_DIR / "bots"
-LOGS_DIR  = BASE_DIR / "logs"
-DATA_DIR  = BASE_DIR / "data"
-
-for d in (BOTS_DIR, LOGS_DIR, DATA_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-USERS_FILE = DATA_DIR / "users.json"
-BOTS_FILE  = DATA_DIR / "bots.json"
-
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════
+#   Logging
+# ═══════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(BASE_DIR / "platform.log"),
+        logging.FileHandler(LOGS_DIR / "bot.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
-logger = logging.getLogger("BotHost")
+logger = logging.getLogger("TelegramHostBot")
 
-# ─────────────────────────────────────────────
-#  CONVERSATION STATES
-# ─────────────────────────────────────────────
-WAIT_FILE, WAIT_NAME, WAIT_CONFIRM = range(3)
+# ═══════════════════════════════════════════
+#   الكلمات الخطيرة الممنوعة في الملفات
+# ═══════════════════════════════════════════
+DANGEROUS_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r"curl\s+.*\|\s*sh",
+    r"wget\s+.*\|\s*sh",
+    r"bash\s+-c\s+.*eval",
+    r"exec\s*\(\s*['\"].*rm",
+    r"os\.system\s*\(['\"].*rm\s+-rf",
+    r"subprocess.*rm\s+-rf",
+    r"__import__\s*\(\s*['\"]os['\"]",
+    r"open\s*\(['\"]\/etc\/(passwd|shadow)",
+    r"\.\.\s*/\s*\.\.\s*/",
+    r"chmod\s+777\s+/",
+    r"mkfs\.",
+    r"dd\s+if=.+of=\/dev",
+]
 
-# ─────────────────────────────────────────────
-#  DATA HELPERS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════
+#   قاعدة البيانات
+# ═══════════════════════════════════════════
+class Database:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
 
-def load_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return default
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
+    def _init_db(self):
+        with self._lock:
+            conn = self._get_conn()
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id     INTEGER PRIMARY KEY,
+                    username    TEXT,
+                    full_name   TEXT,
+                    user_type   TEXT DEFAULT 'free',
+                    joined_at   TEXT DEFAULT (datetime('now')),
+                    is_banned   INTEGER DEFAULT 0
+                );
 
-def save_json(path: Path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                CREATE TABLE IF NOT EXISTS projects (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      INTEGER,
+                    project_name TEXT,
+                    project_type TEXT,
+                    status       TEXT DEFAULT 'stopped',
+                    port         INTEGER,
+                    path         TEXT,
+                    url          TEXT,
+                    created_at   TEXT DEFAULT (datetime('now')),
+                    pid          INTEGER,
+                    UNIQUE(user_id, project_name)
+                );
 
+                CREATE TABLE IF NOT EXISTS activation_codes (
+                    code         TEXT PRIMARY KEY,
+                    user_type    TEXT DEFAULT 'vip',
+                    duration_hrs INTEGER DEFAULT 720,
+                    max_projects INTEGER DEFAULT 10,
+                    used_by      INTEGER,
+                    used_at      TEXT,
+                    created_at   TEXT DEFAULT (datetime('now')),
+                    expires_at   TEXT
+                );
 
-def get_users() -> dict:
-    return load_json(USERS_FILE, {})
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    user_id    INTEGER PRIMARY KEY,
+                    requests   INTEGER DEFAULT 0,
+                    window_start TEXT DEFAULT (datetime('now'))
+                );
 
+                CREATE TABLE IF NOT EXISTS project_logs (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    INTEGER,
+                    project_id INTEGER,
+                    event      TEXT,
+                    message    TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+            """)
+            conn.commit()
+            conn.close()
 
-def save_users(users: dict):
-    save_json(USERS_FILE, users)
+    def execute(self, query: str, params=(), fetchone=False, fetchall=False):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cur = conn.execute(query, params)
+                conn.commit()
+                if fetchone:
+                    return cur.fetchone()
+                if fetchall:
+                    return cur.fetchall()
+                return cur
+            finally:
+                conn.close()
 
+    # ─── Users ───
+    def get_user(self, user_id: int):
+        return self.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,), fetchone=True
+        )
 
-def get_bots() -> dict:
-    return load_json(BOTS_FILE, {})
+    def upsert_user(self, user_id: int, username: str, full_name: str):
+        self.execute(
+            """INSERT INTO users (user_id, username, full_name)
+               VALUES (?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username=excluded.username,
+                   full_name=excluded.full_name""",
+            (user_id, username, full_name),
+        )
 
+    def get_all_users(self):
+        return self.execute("SELECT * FROM users ORDER BY joined_at DESC", fetchall=True)
 
-def save_bots(bots: dict):
-    save_json(BOTS_FILE, bots)
+    def set_user_type(self, user_id: int, user_type: str):
+        self.execute("UPDATE users SET user_type=? WHERE user_id=?", (user_type, user_id))
 
+    # ─── Projects ───
+    def get_projects(self, user_id: int):
+        return self.execute(
+            "SELECT * FROM projects WHERE user_id=? ORDER BY created_at DESC",
+            (user_id,), fetchall=True,
+        )
 
-def register_user(user_id: int, username: str, full_name: str):
-    users = get_users()
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {
-            "id": user_id,
-            "username": username,
-            "full_name": full_name,
-            "joined": datetime.utcnow().isoformat(),
-            "bot_count": 0,
-        }
-        save_users(users)
-    return users[uid]
+    def get_project(self, project_id: int):
+        return self.execute(
+            "SELECT * FROM projects WHERE id=?", (project_id,), fetchone=True
+        )
 
+    def get_project_by_name(self, user_id: int, name: str):
+        return self.execute(
+            "SELECT * FROM projects WHERE user_id=? AND project_name=?",
+            (user_id, name), fetchone=True,
+        )
 
-def generate_bot_id() -> str:
-    """Generate a short unique ID."""
-    import random, string
-    bots = get_bots()
-    while True:
-        bid = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        if bid not in bots:
-            return bid
+    def create_project(self, user_id, name, ptype, path, url, port=None):
+        self.execute(
+            """INSERT INTO projects (user_id, project_name, project_type, path, url, port)
+               VALUES (?,?,?,?,?,?)""",
+            (user_id, name, ptype, path, url, port),
+        )
+        return self.execute(
+            "SELECT * FROM projects WHERE user_id=? AND project_name=?",
+            (user_id, name), fetchone=True,
+        )
 
-# ─────────────────────────────────────────────
-#  PROCESS MANAGER
-# ─────────────────────────────────────────────
+    def update_project_status(self, project_id: int, status: str, pid: int = None):
+        self.execute(
+            "UPDATE projects SET status=?, pid=? WHERE id=?",
+            (status, pid, project_id),
+        )
 
-class ProcessManager:
-    """Manages subprocess lifecycles for hosted bots."""
+    def update_project_port(self, project_id: int, port: int):
+        self.execute("UPDATE projects SET port=? WHERE id=?", (port, project_id))
 
-    _processes: dict = {}   # bot_id -> subprocess.Popen
+    def delete_project(self, project_id: int):
+        self.execute("DELETE FROM projects WHERE id=?", (project_id,))
 
-    @classmethod
-    def find_free_port(cls) -> int:
-        import socket
-        for port in range(PORT_RANGE_START, PORT_RANGE_END):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("0.0.0.0", port))
-                    return port
-                except OSError:
-                    continue
-        raise RuntimeError("No free ports available in configured range.")
+    def count_projects(self, user_id: int):
+        row = self.execute(
+            "SELECT COUNT(*) as c FROM projects WHERE user_id=?", (user_id,), fetchone=True
+        )
+        return row["c"] if row else 0
 
-    @classmethod
-    def detect_bot_type(cls, bot_dir: Path) -> tuple:
-        """
-        Returns (bot_type, start_command, entry_file).
-        bot_type: 'python_flask' | 'python' | 'nodejs' | 'php' | 'html' | 'unknown'
-        """
-        files = list(bot_dir.rglob("*"))
-        names = [f.name.lower() for f in files if f.is_file()]
+    # ─── Activation Codes ───
+    def create_code(self, code: str, user_type: str, duration_hrs: int, max_projects: int):
+        expires = (datetime.now() + timedelta(hours=duration_hrs)).isoformat()
+        self.execute(
+            """INSERT INTO activation_codes
+               (code, user_type, duration_hrs, max_projects, expires_at)
+               VALUES (?,?,?,?,?)""",
+            (code, user_type, duration_hrs, max_projects, expires),
+        )
 
-        # Flask detection: app.py containing 'Flask'
-        for f in files:
-            if f.name.lower() == "app.py" and f.is_file():
-                content = f.read_text(errors="ignore")
-                if "Flask" in content or "flask" in content:
-                    return "python_flask", f"python3 {f.name}", f.name
+    def get_code(self, code: str):
+        return self.execute(
+            "SELECT * FROM activation_codes WHERE code=?", (code,), fetchone=True
+        )
 
-        # Node.js
-        for entry in ("index.js", "bot.js", "main.js", "app.js", "server.js"):
-            if entry in names:
-                return "nodejs", f"node {entry}", entry
-            
-        if "package.json" in names:
-            pkg = json.loads((bot_dir / "package.json").read_text(errors="ignore"))
-            main_file = pkg.get("main", "index.js")
-            return "nodejs", f"node {main_file}", main_file
+    def use_code(self, code: str, user_id: int):
+        self.execute(
+            "UPDATE activation_codes SET used_by=?, used_at=datetime('now') WHERE code=?",
+            (user_id, code),
+        )
 
-        # PHP
-        for entry in ("bot.php", "index.php", "main.php"):
-            if entry in names:
-                return "php", f"php {entry}", entry
-
-        # HTML
-        for entry in ("index.html", "app.html"):
-            if entry in names:
-                return "html", None, entry
-
-        # Python generic
-        for entry in ("main.py", "bot.py", "run.py", "start.py"):
-            if entry in names:
-                return "python", f"python3 {entry}", entry
-
-        # Fallback: any .py
-        py_files = [f for f in files if f.suffix == ".py" and f.is_file()]
-        if py_files:
-            entry = py_files[0].name
-            return "python", f"python3 {entry}", entry
-
-        return "unknown", None, None
-
-    @classmethod
-    def is_running(cls, bot_id: str) -> bool:
-        proc = cls._processes.get(bot_id)
-        if proc is None:
-            return False
-        return proc.poll() is None
-
-    @classmethod
-    def start(cls, bot_id: str, bot_dir: Path, command: str, log_file: Path) -> bool:
-        """Start a bot subprocess."""
-        if cls.is_running(bot_id):
-            return True  # Already running
-
-        parts = command.split()
-        # Security: block dangerous commands
-        for pattern in BLOCKED_PATTERNS:
-            if pattern in command:
-                raise ValueError(f"Blocked command pattern detected: {pattern}")
-
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        log_fd = open(log_file, "a", encoding="utf-8")
-
-        try:
-            proc = subprocess.Popen(
-                parts,
-                cwd=str(bot_dir),
-                stdout=log_fd,
-                stderr=log_fd,
-                start_new_session=True,
-                env={**os.environ, "BOT_ID": bot_id},
+    # ─── Rate Limiting ───
+    def check_rate_limit(self, user_id: int) -> bool:
+        """يرجع True إذا كان مسموحاً، False إذا تجاوز الحد"""
+        row = self.execute(
+            "SELECT * FROM rate_limits WHERE user_id=?", (user_id,), fetchone=True
+        )
+        now = datetime.now()
+        if row is None:
+            self.execute(
+                "INSERT INTO rate_limits (user_id, requests, window_start) VALUES (?,1,?)",
+                (user_id, now.isoformat()),
             )
-            cls._processes[bot_id] = proc
-            logger.info(f"Started bot {bot_id} with PID {proc.pid}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to start bot {bot_id}: {e}")
-            raise
+        window_start = datetime.fromisoformat(row["window_start"])
+        if (now - window_start).total_seconds() > 60:
+            self.execute(
+                "UPDATE rate_limits SET requests=1, window_start=? WHERE user_id=?",
+                (now.isoformat(), user_id),
+            )
+            return True
+        if row["requests"] >= RATE_LIMIT_PER_MINUTE:
+            return False
+        self.execute(
+            "UPDATE rate_limits SET requests=requests+1 WHERE user_id=?", (user_id,)
+        )
+        return True
 
-    @classmethod
-    def stop(cls, bot_id: str) -> bool:
-        proc = cls._processes.get(bot_id)
-        if proc is None or proc.poll() is not None:
-            cls._processes.pop(bot_id, None)
-            return True
+    # ─── Logs ───
+    def add_log(self, user_id: int, project_id: int, event: str, message: str):
+        self.execute(
+            "INSERT INTO project_logs (user_id, project_id, event, message) VALUES (?,?,?,?)",
+            (user_id, project_id, event, message),
+        )
+
+    def get_logs(self, user_id: int = None, project_id: int = None, limit: int = 50):
+        if user_id and project_id:
+            return self.execute(
+                "SELECT * FROM project_logs WHERE user_id=? AND project_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, project_id, limit), fetchall=True,
+            )
+        elif user_id:
+            return self.execute(
+                "SELECT * FROM project_logs WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit), fetchall=True,
+            )
+        else:
+            return self.execute(
+                "SELECT * FROM project_logs ORDER BY created_at DESC LIMIT ?",
+                (limit,), fetchall=True,
+            )
+
+
+db = Database(str(DB_PATH))
+
+# ═══════════════════════════════════════════
+#   إدارة المنافذ
+# ═══════════════════════════════════════════
+_used_ports: set = set()
+_ports_lock = threading.Lock()
+
+
+def get_free_port() -> int:
+    with _ports_lock:
+        used_by_system = {conn.laddr.port for conn in psutil.net_connections()}
+        for _ in range(200):
+            port = random.randint(API_PORT_START, API_PORT_END)
+            if port not in _used_ports and port not in used_by_system:
+                _used_ports.add(port)
+                return port
+    raise RuntimeError("لا يوجد منفذ متاح")
+
+
+def release_port(port: int):
+    with _ports_lock:
+        _used_ports.discard(port)
+
+
+# ═══════════════════════════════════════════
+#   فحص الملفات الضارة
+# ═══════════════════════════════════════════
+def scan_file_content(file_path: Path) -> tuple[bool, str]:
+    """يرجع (آمن, سبب_الرفض)"""
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+        for pattern in DANGEROUS_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return False, f"نمط خطير مكتشف: {pattern}"
+        return True, ""
+    except Exception:
+        return True, ""  # ملفات غير نصية (صور، إلخ) تعتبر آمنة
+
+
+def scan_project_dir(project_path: Path) -> tuple[bool, str]:
+    dangerous_exts = {".exe", ".sh", ".bat", ".cmd", ".ps1"}
+    for f in project_path.rglob("*"):
+        if f.is_file():
+            if f.suffix.lower() in dangerous_exts:
+                return False, f"امتداد خطير: {f.name}"
+            # فحص مسار نسبي (Path Traversal)
+            try:
+                f.resolve().relative_to(project_path.resolve())
+            except ValueError:
+                return False, "محاولة Path Traversal مكتشفة"
+            safe, reason = scan_file_content(f)
+            if not safe:
+                return False, f"{f.name}: {reason}"
+    return True, ""
+
+
+# ═══════════════════════════════════════════
+#   اكتشاف نوع المشروع
+# ═══════════════════════════════════════════
+def detect_project_type(project_path: Path) -> str:
+    files = list(project_path.rglob("*"))
+    names = {f.name.lower() for f in files if f.is_file()}
+    contents = {}
+
+    def read(name):
+        p = project_path / name
+        if p.exists():
+            return p.read_text(encoding="utf-8", errors="ignore")
+        return ""
+
+    if "package.json" in names:
+        return "nodejs"
+    if any(n.endswith(".php") for n in names):
+        return "php"
+    if "app.py" in names:
+        txt = read("app.py")
+        if "fastapi" in txt.lower():
+            return "fastapi"
+        if "flask" in txt.lower():
+            return "flask"
+        return "python"
+    if "main.py" in names:
+        txt = read("main.py")
+        if "fastapi" in txt.lower():
+            return "fastapi"
+        if "flask" in txt.lower():
+            return "flask"
+        return "python"
+    if any(n.endswith(".html") for n in names):
+        return "html"
+    return "unknown"
+
+
+# ═══════════════════════════════════════════
+#   تشغيل وإيقاف المشاريع
+# ═══════════════════════════════════════════
+_running_processes: dict[int, subprocess.Popen] = {}  # project_id -> process
+_processes_lock = threading.Lock()
+
+
+def _get_entry_file(project_path: Path, ptype: str) -> Optional[Path]:
+    candidates = {
+        "flask": ["app.py", "main.py", "run.py", "server.py"],
+        "fastapi": ["app.py", "main.py", "run.py"],
+        "python": ["main.py", "app.py", "run.py"],
+        "nodejs": ["index.js", "app.js", "server.js", "main.js"],
+        "php": ["index.php", "app.php"],
+    }
+    for name in candidates.get(ptype, []):
+        p = project_path / name
+        if p.exists():
+            return p
+    return None
+
+
+def start_project(project_id: int) -> tuple[bool, str]:
+    project = db.get_project(project_id)
+    if not project:
+        return False, "المشروع غير موجود"
+
+    ptype = project["project_type"]
+    path = Path(project["path"])
+
+    if ptype == "html":
+        db.update_project_status(project_id, "running")
+        db.add_log(project["user_id"], project_id, "START", "مشروع HTML يعمل عبر الخادم الثابت")
+        return True, "مشروع HTML يعمل تلقائياً عبر الخادم الثابت"
+
+    port = project["port"]
+    if not port:
+        port = get_free_port()
+        db.update_project_port(project_id, port)
+
+    entry = _get_entry_file(path, ptype)
+    if not entry:
+        return False, f"لم يُعثر على ملف التشغيل لنوع {ptype}"
+
+    log_file = LOGS_DIR / f"project_{project_id}.log"
+
+    if ptype in ("flask", "python"):
+        cmd = [sys.executable, str(entry)]
+        env = {**os.environ, "PORT": str(port), "FLASK_RUN_PORT": str(port), "HOST": "0.0.0.0"}
+    elif ptype == "fastapi":
+        cmd = [sys.executable, "-m", "uvicorn",
+               entry.stem + ":app", "--host", "0.0.0.0", "--port", str(port)]
+        env = {**os.environ}
+    elif ptype == "nodejs":
+        cmd = ["node", str(entry)]
+        env = {**os.environ, "PORT": str(port)}
+    elif ptype == "php":
+        cmd = ["php", "-S", f"0.0.0.0:{port}", "-t", str(path)]
+        env = {**os.environ}
+    else:
+        return False, f"نوع غير مدعوم: {ptype}"
+
+    try:
+        with open(log_file, "a", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(path),
+                env=env,
+                stdout=lf,
+                stderr=lf,
+                preexec_fn=os.setsid if sys.platform != "win32" else None,
+            )
+        with _processes_lock:
+            _running_processes[project_id] = proc
+        db.update_project_status(project_id, "running", proc.pid)
+        db.add_log(project["user_id"], project_id, "START",
+                   f"تم تشغيل المشروع على المنفذ {port} — PID: {proc.pid}")
+        logger.info(f"تشغيل مشروع #{project_id} على المنفذ {port} — PID {proc.pid}")
+        return True, f"تم التشغيل على المنفذ {port}"
+    except Exception as e:
+        logger.error(f"خطأ في تشغيل المشروع {project_id}: {e}")
+        db.add_log(project["user_id"], project_id, "ERROR", str(e))
+        return False, str(e)
+
+
+def stop_project(project_id: int) -> tuple[bool, str]:
+    project = db.get_project(project_id)
+    if not project:
+        return False, "المشروع غير موجود"
+
+    with _processes_lock:
+        proc = _running_processes.pop(project_id, None)
+
+    if proc:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
             proc.wait(timeout=5)
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
-        cls._processes.pop(bot_id, None)
-        logger.info(f"Stopped bot {bot_id}")
-        return True
 
-    @classmethod
-    def get_resource_usage(cls, bot_id: str) -> dict:
-        proc = cls._processes.get(bot_id)
-        if proc is None or proc.poll() is not None:
-            return {"running": False}
-        try:
-            p = psutil.Process(proc.pid)
-            cpu = p.cpu_percent(interval=0.5)
-            mem = p.memory_info().rss / (1024 * 1024)
-            create_time = p.create_time()
-            uptime = int(time.time() - create_time)
-            return {
-                "running": True,
-                "pid": proc.pid,
-                "cpu_percent": round(cpu, 2),
-                "ram_mb": round(mem, 2),
-                "uptime_seconds": uptime,
-                "uptime_human": str(timedelta(seconds=uptime)),
-            }
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return {"running": False}
+    if project["port"]:
+        release_port(project["port"])
 
-# ─────────────────────────────────────────────
-#  STORAGE HELPER
-# ─────────────────────────────────────────────
-
-def get_user_storage_mb(user_id: int) -> float:
-    user_dir = BOTS_DIR / str(user_id)
-    if not user_dir.exists():
-        return 0.0
-    total = sum(f.stat().st_size for f in user_dir.rglob("*") if f.is_file())
-    return total / (1024 * 1024)
+    db.update_project_status(project_id, "stopped", None)
+    db.add_log(project["user_id"], project_id, "STOP", "تم إيقاف المشروع")
+    logger.info(f"إيقاف مشروع #{project_id}")
+    return True, "تم الإيقاف"
 
 
-def get_log_tail(log_file: Path, lines: int = 20) -> str:
-    if not log_file.exists():
-        return "No logs found."
-    try:
-        content = log_file.read_text(errors="replace").splitlines()
-        tail = content[-lines:] if len(content) > lines else content
-        return "\n".join(tail) if tail else "Log file is empty."
-    except Exception as e:
-        return f"Error reading log: {e}"
+# ═══════════════════════════════════════════
+#   Watchdog — مراقبة العمليات وإعادة تشغيلها
+# ═══════════════════════════════════════════
+def watchdog_loop():
+    logger.info("Watchdog بدأ")
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        with _processes_lock:
+            ids = list(_running_processes.keys())
+        for pid in ids:
+            with _processes_lock:
+                proc = _running_processes.get(pid)
+            if proc and proc.poll() is not None:
+                logger.warning(f"Watchdog: مشروع #{pid} توقف، جارٍ إعادة التشغيل...")
+                project = db.get_project(pid)
+                if project:
+                    db.add_log(project["user_id"], pid, "WATCHDOG",
+                               "أُعيد تشغيل المشروع تلقائياً بواسطة Watchdog")
+                with _processes_lock:
+                    _running_processes.pop(pid, None)
+                db.update_project_status(pid, "stopped")
+                start_project(pid)
 
-# ─────────────────────────────────────────────
-#  FLASK APPLICATION (file server)
-# ─────────────────────────────────────────────
 
+watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+watchdog_thread.start()
+
+# ═══════════════════════════════════════════
+#   خادم Flask للملفات الثابتة والـ APIs
+# ═══════════════════════════════════════════
 flask_app = Flask(__name__)
+ALLOWED_EXTENSIONS = {".html", ".css", ".js", ".png", ".jpg", ".jpeg",
+                      ".ico", ".json", ".svg", ".gif", ".woff", ".woff2", ".ttf"}
 
 
-@flask_app.route("/")
-def flask_index():
-    bots = get_bots()
-    return jsonify({
-        "service": "Bot Hosting Platform",
-        "total_bots": len(bots),
-        "running": sum(1 for b in bots.values() if ProcessManager.is_running(b["id"])),
-    })
+@flask_app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 
-@flask_app.route("/<int:user_id>/<bot_name>/<path:filename>")
-def serve_bot_file(user_id: int, bot_name: str, filename: str):
-    """Serve a file from a hosted bot directory."""
-    target = BOTS_DIR / str(user_id) / bot_name / filename
-    if not target.exists() or not target.is_file():
+@flask_app.route("/static/<int:user_id>/<project_name>/", defaults={"filename": "index.html"})
+@flask_app.route("/static/<int:user_id>/<project_name>/<path:filename>")
+def serve_static(user_id, project_name, filename):
+    # منع Path Traversal
+    if ".." in filename or filename.startswith("/"):
+        abort(403)
+
+    project = db.get_project_by_name(user_id, project_name)
+    if not project or project["project_type"] != "html":
         abort(404)
-    # Security: ensure path is within bots directory
+    if project["status"] == "deleted":
+        abort(410)
+
+    project_path = Path(project["path"])
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        abort(403)
+
     try:
-        target.resolve().relative_to(BOTS_DIR.resolve())
+        project_path.resolve().relative_to(PROJECTS_DIR.resolve())
     except ValueError:
         abort(403)
-    return send_file(str(target))
+
+    return send_from_directory(str(project_path), filename)
 
 
-@flask_app.route("/status/<bot_id>")
-def bot_status_api(bot_id: str):
-    bots = get_bots()
-    if bot_id not in bots:
-        return jsonify({"error": "Bot not found"}), 404
-    usage = ProcessManager.get_resource_usage(bot_id)
-    return jsonify({**bots[bot_id], **usage})
+@flask_app.route("/api/<int:user_id>/<project_name>/", defaults={"path": ""})
+@flask_app.route("/api/<int:user_id>/<project_name>/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
+def proxy_api(user_id, project_name, path):
+    project = db.get_project_by_name(user_id, project_name)
+    if not project or project["project_type"] == "html":
+        abort(404)
+    if project["status"] != "running":
+        return Response(
+            json.dumps({"error": "المشروع متوقف حالياً"}),
+            status=503, mimetype="application/json"
+        )
+
+    port = project["port"]
+    if not port:
+        abort(502)
+
+    import urllib.request
+    import urllib.error
+    target = f"http://127.0.0.1:{port}/{path}"
+    if request.query_string:
+        target += "?" + request.query_string.decode()
+
+    try:
+        req = urllib.request.Request(
+            target,
+            data=request.get_data() or None,
+            headers={k: v for k, v in request.headers if k != "Host"},
+            method=request.method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            return Response(body, status=resp.status,
+                            content_type=resp.headers.get("Content-Type", "application/json"))
+    except urllib.error.URLError as e:
+        return Response(
+            json.dumps({"error": "تعذّر الاتصال بالمشروع", "detail": str(e)}),
+            status=502, mimetype="application/json"
+        )
+
+
+@flask_app.route("/health")
+def health():
+    return {"status": "ok", "time": datetime.now().isoformat()}
 
 
 def run_flask():
-    flask_app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, use_reloader=False)
+    import logging as _log
+    _log.getLogger("werkzeug").setLevel(_log.WARNING)
+    flask_app.run(host=HOST, port=HOST_PORT, debug=False, use_reloader=False, threaded=True)
 
-# ─────────────────────────────────────────────
-#  KEYBOARD BUILDERS
-# ─────────────────────────────────────────────
 
-def main_menu_keyboard():
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+logger.info(f"خادم Flask يعمل على المنفذ {HOST_PORT}")
+
+# ═══════════════════════════════════════════
+#   ThreadPool لمعالجة الملفات
+# ═══════════════════════════════════════════
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+# ═══════════════════════════════════════════
+#   دوال مساعدة للبوت
+# ═══════════════════════════════════════════
+def get_user_limit(user_type: str) -> int:
+    if user_type == "owner":
+        return 9999
+    if user_type == "vip":
+        return MAX_PROJECTS_VIP
+    return MAX_PROJECTS_FREE
+
+
+def build_project_url(user_id: int, project_name: str, ptype: str) -> str:
+    if ptype == "html":
+        return f"{BASE_URL}/static/{user_id}/{project_name}/"
+    return f"{BASE_URL}/api/{user_id}/{project_name}/"
+
+
+async def check_mandatory_channels(bot: Bot, user_id: int) -> list[str]:
+    """يرجع قائمة القنوات التي لم يشترك بها المستخدم"""
+    not_joined = []
+    for channel in MANDATORY_CHANNELS:
+        try:
+            member = await bot.get_chat_member(channel, user_id)
+            if member.status in ("left", "kicked"):
+                not_joined.append(channel)
+        except Exception:
+            not_joined.append(channel)
+    return not_joined
+
+
+def projects_keyboard(projects) -> InlineKeyboardMarkup:
+    buttons = []
+    for p in projects:
+        status_emoji = "🟢" if p["status"] == "running" else "🔴"
+        buttons.append([
+            InlineKeyboardButton(
+                f"{status_emoji} {p['project_name']} ({p['project_type']})",
+                callback_data=f"project_menu:{p['id']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("➕ مشروع جديد", callback_data="new_project")])
+    buttons.append([InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def project_detail_keyboard(project_id: int, status: str) -> InlineKeyboardMarkup:
+    toggle = ("⏹ إيقاف", f"stop:{project_id}") if status == "running" \
+        else ("▶️ تشغيل", f"start:{project_id}")
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("New Bot", callback_data="menu_new"),
-            InlineKeyboardButton("My Bots", callback_data="menu_list"),
-        ],
-        [
-            InlineKeyboardButton("Help", callback_data="menu_help"),
-        ],
+        [InlineKeyboardButton(toggle[0], callback_data=toggle[1])],
+        [InlineKeyboardButton("🔗 رابط المشروع", callback_data=f"url:{project_id}")],
+        [InlineKeyboardButton("📋 السجلات", callback_data=f"logs:{project_id}")],
+        [InlineKeyboardButton("🗑 حذف المشروع", callback_data=f"delete_confirm:{project_id}")],
+        [InlineKeyboardButton("🔙 مشاريعي", callback_data="my_projects")],
     ])
 
 
-def bot_actions_keyboard(bot_id: str, running: bool):
-    row1 = []
-    if running:
-        row1.append(InlineKeyboardButton("Stop", callback_data=f"action_stop_{bot_id}"))
-        row1.append(InlineKeyboardButton("Restart", callback_data=f"action_restart_{bot_id}"))
-    else:
-        row1.append(InlineKeyboardButton("Start", callback_data=f"action_start_{bot_id}"))
-
-    row2 = [
-        InlineKeyboardButton("Logs", callback_data=f"action_logs_{bot_id}"),
-        InlineKeyboardButton("Status", callback_data=f"action_status_{bot_id}"),
+def main_menu_keyboard(user_type: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("📁 مشاريعي", callback_data="my_projects")],
+        [InlineKeyboardButton("➕ مشروع جديد", callback_data="new_project")],
     ]
-    row3 = [
-        InlineKeyboardButton("URL", callback_data=f"action_url_{bot_id}"),
-        InlineKeyboardButton("Delete", callback_data=f"action_delete_{bot_id}"),
-    ]
-    row4 = [InlineKeyboardButton("Back to list", callback_data="menu_list")]
-    return InlineKeyboardMarkup([row1, row2, row3, row4])
+    if user_type == "owner":
+        buttons.append([InlineKeyboardButton("👑 لوحة المالك", callback_data="owner_panel")])
+    return InlineKeyboardMarkup(buttons)
 
 
-def confirm_delete_keyboard(bot_id: str):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes, delete", callback_data=f"confirm_delete_{bot_id}"),
-            InlineKeyboardButton("Cancel", callback_data=f"action_view_{bot_id}"),
-        ]
-    ])
-
-# ─────────────────────────────────────────────
-#  COMMAND HANDLERS
-# ─────────────────────────────────────────────
-
+# ═══════════════════════════════════════════
+#   معالجات أوامر البوت
+# ═══════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user.id, user.username or "", user.full_name or "")
+    db.upsert_user(user.id, user.username or "", user.full_name or "")
+
+    if user.id == OWNER_ID:
+        db.set_user_type(user.id, "owner")
+
+    row = db.get_user(user.id)
+    if not row or row["is_banned"]:
+        await update.message.reply_text("⛔ أنت محظور من استخدام هذا البوت.")
+        return
+
+    if not db.check_rate_limit(user.id):
+        await update.message.reply_text("⚠️ تجاوزت حد الطلبات. انتظر دقيقة.")
+        return
+
+    not_joined = await check_mandatory_channels(context.bot, user.id)
+    if not_joined:
+        links = "\n".join(f"• {c}" for c in not_joined)
+        await update.message.reply_text(
+            f"📢 يجب عليك الاشتراك في القنوات التالية أولاً:\n{links}\n\nثم اضغط /start مجدداً."
+        )
+        return
+
+    user_type = row["user_type"] if row else "free"
     text = (
-        f"Welcome to the Bot Hosting Platform, {user.first_name}.\n\n"
-        "You can upload, run, and manage your bots from here.\n"
-        "Use the buttons below or type /help to see all commands."
+        f"👋 مرحباً {user.full_name}!\n\n"
+        f"🤖 بوت استضافة المشاريع\n"
+        f"📊 نوع حسابك: {'👑 مالك' if user_type=='owner' else '⭐ VIP' if user_type=='vip' else '👤 مجاني'}\n\n"
+        f"أرسل ملف ZIP لنشر مشروعك أو استخدم القائمة أدناه."
     )
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard(user_type))
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Available Commands\n"
-        "──────────────────\n"
-        "/start       - Welcome screen\n"
-        "/new         - Upload and deploy a new bot (zip file)\n"
-        "/list        - List all your bots with their IDs\n"
-        "/stop ID     - Stop a running bot\n"
-        "/startbot ID - Start a stopped bot\n"
-        "/restart ID  - Restart a bot\n"
-        "/delete ID   - Permanently delete a bot\n"
-        "/logs ID     - View last 20 log lines\n"
-        "/status ID   - View CPU, RAM, uptime\n"
-        "/url ID      - Get direct file URL (Flask bots)\n"
-        "/help        - Show this message\n\n"
-        "How to deploy a bot:\n"
-        "1. Compress your bot files into a ZIP archive.\n"
-        "2. Send /new and upload the ZIP file.\n"
-        "3. The platform detects the bot type automatically.\n"
-        "4. Confirm and the bot starts immediately.\n\n"
-        f"Storage limit: {MAX_STORAGE_MB} MB per user.\n"
-        f"Bot limit: {MAX_BOTS_USER} bots per user."
-    )
-    await update.message.reply_text(text)
-
-
-async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user.id, user.username or "", user.full_name or "")
-
-    # Check bot count
-    bots = get_bots()
-    user_bots = [b for b in bots.values() if b["user_id"] == user.id]
-    if len(user_bots) >= MAX_BOTS_USER:
-        await update.message.reply_text(
-            f"You have reached the maximum of {MAX_BOTS_USER} bots.\n"
-            "Delete an existing bot before adding a new one."
-        )
-        return ConversationHandler.END
-
-    # Check storage
-    used_mb = get_user_storage_mb(user.id)
-    if used_mb >= MAX_STORAGE_MB:
-        await update.message.reply_text(
-            f"Storage limit reached ({MAX_STORAGE_MB} MB).\n"
-            "Delete some bots to free space."
-        )
-        return ConversationHandler.END
-
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /activate <الكود>")
+        return
+    code_str = context.args[0].strip()
+    code_row = db.get_code(code_str)
+    if not code_row:
+        await update.message.reply_text("❌ الكود غير صحيح.")
+        return
+    if code_row["used_by"]:
+        await update.message.reply_text("❌ هذا الكود مستخدم مسبقاً.")
+        return
+    if datetime.fromisoformat(code_row["expires_at"]) < datetime.now():
+        await update.message.reply_text("❌ انتهت صلاحية هذا الكود.")
+        return
+    db.use_code(code_str, user.id)
+    db.set_user_type(user.id, code_row["user_type"])
     await update.message.reply_text(
-        "Send me your bot as a ZIP file.\n"
-        "The archive should contain your entry file at the root level.\n\n"
-        "Supported: Python, Node.js, PHP, HTML, Flask.\n"
-        "Send /cancel to abort."
-    )
-    return WAIT_FILE
-
-
-async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    doc = update.message.document
-
-    if not doc or not doc.file_name.lower().endswith(".zip"):
-        await update.message.reply_text(
-            "Please send a valid ZIP file.\n"
-            "Send /cancel to abort."
-        )
-        return WAIT_FILE
-
-    # Check storage
-    used_mb = get_user_storage_mb(user.id)
-    file_mb = (doc.file_size or 0) / (1024 * 1024)
-    if used_mb + file_mb > MAX_STORAGE_MB:
-        await update.message.reply_text(
-            f"This file would exceed your storage limit of {MAX_STORAGE_MB} MB.\n"
-            f"Currently used: {used_mb:.1f} MB."
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text("Downloading and extracting your file...")
-
-    bot_id = generate_bot_id()
-    user_dir = BOTS_DIR / str(user.id)
-    zip_path = user_dir / f"{bot_id}.zip"
-    user_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        await tg_file.download_to_drive(str(zip_path))
-
-        # Extract
-        extract_dir = user_dir / bot_id
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            # Security: prevent path traversal in zip
-            for member in zf.namelist():
-                target = (extract_dir / member).resolve()
-                if not str(target).startswith(str(extract_dir.resolve())):
-                    raise ValueError(f"Path traversal detected in zip: {member}")
-            zf.extractall(str(extract_dir))
-
-        zip_path.unlink(missing_ok=True)
-
-        # Flatten single top-level directory
-        items = list(extract_dir.iterdir())
-        if len(items) == 1 and items[0].is_dir():
-            inner = items[0]
-            for f in inner.iterdir():
-                shutil.move(str(f), str(extract_dir / f.name))
-            inner.rmdir()
-
-        bot_type, start_cmd, entry_file = ProcessManager.detect_bot_type(extract_dir)
-
-        context.user_data["pending_bot"] = {
-            "id": bot_id,
-            "bot_type": bot_type,
-            "start_command": start_cmd,
-            "entry_file": entry_file,
-            "extract_dir": str(extract_dir),
-            "user_id": user.id,
-        }
-
-        detected_info = (
-            f"Extraction complete.\n\n"
-            f"Detected type: {bot_type.replace('_', ' ').title()}\n"
-            f"Entry file:    {entry_file or 'N/A'}\n"
-            f"Start command: {start_cmd or 'N/A (static file)'}\n\n"
-            "What name should this bot have? (letters, digits, underscores only)\n"
-            "Example: my_bot\n\n"
-            "Send /cancel to abort."
-        )
-        await update.message.reply_text(detected_info)
-        return WAIT_NAME
-
-    except Exception as e:
-        logger.error(f"Upload error for user {user.id}: {e}")
-        shutil.rmtree(str(user_dir / bot_id), ignore_errors=True)
-        zip_path.unlink(missing_ok=True)
-        await update.message.reply_text(f"Error processing file: {e}")
-        return ConversationHandler.END
-
-
-async def handle_bot_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    import re
-    if not re.match(r"^[a-zA-Z0-9_]{1,32}$", name):
-        await update.message.reply_text(
-            "Invalid name. Use only letters, digits, and underscores (max 32 chars).\n"
-            "Try again or send /cancel."
-        )
-        return WAIT_NAME
-
-    pending = context.user_data.get("pending_bot", {})
-    pending["name"] = name
-    context.user_data["pending_bot"] = pending
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Confirm and Deploy", callback_data="deploy_confirm"),
-            InlineKeyboardButton("Cancel", callback_data="deploy_cancel"),
-        ]
-    ])
-    summary = (
-        f"Ready to deploy:\n\n"
-        f"Name:    {name}\n"
-        f"Type:    {pending['bot_type'].replace('_', ' ').title()}\n"
-        f"Command: {pending['start_command'] or 'Static (no process)'}\n\n"
-        "Confirm deployment?"
-    )
-    await update.message.reply_text(summary, reply_markup=keyboard)
-    return WAIT_CONFIRM
-
-
-async def handle_deploy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "deploy_cancel":
-        pending = context.user_data.pop("pending_bot", {})
-        if pending.get("extract_dir"):
-            shutil.rmtree(pending["extract_dir"], ignore_errors=True)
-        await query.edit_message_text("Deployment cancelled.")
-        return ConversationHandler.END
-
-    # Confirm
-    pending = context.user_data.pop("pending_bot", {})
-    user = update.effective_user
-    bot_id    = pending["id"]
-    name      = pending["name"]
-    bot_type  = pending["bot_type"]
-    start_cmd = pending["start_command"]
-    entry_file = pending["entry_file"]
-    extract_dir = Path(pending["extract_dir"])
-
-    # Rename directory to bot name
-    final_dir = BOTS_DIR / str(user.id) / name
-    if final_dir.exists():
-        shutil.rmtree(str(final_dir))
-    shutil.move(str(extract_dir), str(final_dir))
-
-    log_file = LOGS_DIR / str(user.id) / f"{bot_id}.log"
-
-    bot_record = {
-        "id": bot_id,
-        "name": name,
-        "user_id": user.id,
-        "bot_type": bot_type,
-        "start_command": start_cmd,
-        "entry_file": entry_file,
-        "directory": str(final_dir),
-        "log_file": str(log_file),
-        "created": datetime.utcnow().isoformat(),
-        "status": "stopped",
-        "port": None,
-        "url": None,
-    }
-
-    # Build URL for Flask bots
-    if bot_type == "python_flask" and entry_file:
-        bot_record["url"] = f"{SERVER_HOST}/{user.id}/{name}/{entry_file}"
-
-    bots = get_bots()
-    bots[bot_id] = bot_record
-    save_bots(bots)
-
-    # Start the process
-    result_text = ""
-    if start_cmd:
-        try:
-            ProcessManager.start(bot_id, final_dir, start_cmd, log_file)
-            bots[bot_id]["status"] = "running"
-            save_bots(bots)
-            result_text = (
-                f"Bot deployed and started successfully.\n\n"
-                f"ID:      {bot_id}\n"
-                f"Name:    {name}\n"
-                f"Type:    {bot_type.replace('_', ' ').title()}\n"
-                f"Status:  Running\n"
-            )
-            if bot_record["url"]:
-                result_text += f"URL:     {bot_record['url']}\n"
-            result_text += f"\nUse /logs {bot_id} to see output."
-        except Exception as e:
-            result_text = (
-                f"Bot saved but failed to start: {e}\n"
-                f"ID: {bot_id}\n"
-                f"Use /startbot {bot_id} to retry."
-            )
-    else:
-        result_text = (
-            f"Static bot deployed (no process).\n\n"
-            f"ID:   {bot_id}\n"
-            f"Name: {name}\n"
-        )
-        if bot_record["url"]:
-            result_text += f"URL:  {bot_record['url']}\n"
-
-    await query.edit_message_text(result_text)
-    return ConversationHandler.END
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = context.user_data.pop("pending_bot", {})
-    if pending.get("extract_dir"):
-        shutil.rmtree(pending["extract_dir"], ignore_errors=True)
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    bots = get_bots()
-    user_bots = [b for b in bots.values() if b["user_id"] == user.id]
-
-    if not user_bots:
-        await update.message.reply_text(
-            "You have no deployed bots yet.\n"
-            "Use /new to deploy your first bot."
-        )
-        return
-
-    lines = [f"Your bots ({len(user_bots)}/{MAX_BOTS_USER}):\n"]
-    buttons = []
-    for b in sorted(user_bots, key=lambda x: x["created"]):
-        running = ProcessManager.is_running(b["id"])
-        status = "Running" if running else "Stopped"
-        lines.append(f"- {b['name']} ({b['id']}) | {status} | {b['bot_type'].replace('_',' ').title()}")
-        buttons.append([InlineKeyboardButton(f"Manage: {b['name']}", callback_data=f"action_view_{b['id']}")])
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-    )
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /stop <bot_id>")
-        return
-    await _stop_bot(update, context, args[0])
-
-
-async def cmd_startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /startbot <bot_id>")
-        return
-    await _start_bot(update, context, args[0])
-
-
-async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /restart <bot_id>")
-        return
-    bot_id = args[0]
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    ProcessManager.stop(bot_id)
-    await asyncio.sleep(1)
-    await _start_bot(update, context, bot_id)
-
-
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /delete <bot_id>")
-        return
-    bot_id = args[0]
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    keyboard = confirm_delete_keyboard(bot_id)
-    await update.message.reply_text(
-        f"Are you sure you want to permanently delete bot '{bots[bot_id]['name']}' ({bot_id})?\n"
-        "This cannot be undone.",
-        reply_markup=keyboard,
+        f"✅ تم تفعيل حسابك كـ {code_row['user_type'].upper()}!\n"
+        f"📦 عدد المشاريع المسموحة: {code_row['max_projects']}\n"
+        f"⏳ الصلاحية: {code_row['duration_hrs']} ساعة"
     )
 
 
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = db.get_user(user.id)
+    if not row:
+        return
+
+    if user.id == OWNER_ID:
+        logs = db.get_logs(limit=30)
+    else:
+        logs = db.get_logs(user_id=user.id, limit=20)
+
+    if not logs:
+        await update.message.reply_text("📋 لا توجد سجلات بعد.")
+        return
+
+    text = "📋 *آخر السجلات:*\n\n"
+    for log in logs:
+        text += (
+            f"[{log['created_at'][:16]}] "
+            f"{'👤' if log['user_id'] != OWNER_ID else '👑'} "
+            f"#{log['project_id']} — {log['event']}: {log['message'][:60]}\n"
+        )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا الأمر للمالك فقط.")
+        return
+    users = db.get_all_users()
+    text = f"👥 *المستخدمون ({len(users)}):*\n\n"
+    for u in users[:30]:
+        count = db.count_projects(u["user_id"])
+        text += (
+            f"• {u['full_name'] or u['username'] or u['user_id']} "
+            f"[{u['user_type']}] — {count} مشروع\n"
+        )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا الأمر للمالك فقط.")
+        return
+    cpu = psutil.cpu_percent(interval=1)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    running = sum(1 for p in db.execute(
+        "SELECT status FROM projects", fetchall=True) if p["status"] == "running")
+    text = (
+        f"📊 *إحصائيات النظام:*\n\n"
+        f"🖥 CPU: {cpu}%\n"
+        f"💾 RAM: {mem.percent}% ({mem.used//1024//1024} / {mem.total//1024//1024} MB)\n"
+        f"💿 Disk: {disk.percent}% ({disk.used//1024//1024//1024:.1f} / {disk.total//1024//1024//1024:.1f} GB)\n"
+        f"🚀 مشاريع تعمل: {running}\n"
+        f"🕐 الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    للمالك: /gencode <vip|free> <ساعات> <أقصى_مشاريع>
+    مثال: /gencode vip 720 10
+    """
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا الأمر للمالك فقط.")
+        return
     args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /logs <bot_id>")
+    if len(args) < 3:
+        await update.message.reply_text("الاستخدام: /gencode <vip|free> <ساعات> <أقصى_مشاريع>")
         return
-    bot_id = args[0]
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
+    user_type = args[0].lower()
+    if user_type not in ("vip", "free"):
+        await update.message.reply_text("نوع الحساب يجب أن يكون vip أو free")
         return
-    log_file = Path(bots[bot_id]["log_file"])
-    tail = get_log_tail(log_file, 20)
+    try:
+        hours = int(args[1])
+        max_proj = int(args[2])
+    except ValueError:
+        await update.message.reply_text("الساعات وعدد المشاريع يجب أن تكون أرقاماً.")
+        return
+
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+    db.create_code(code, user_type, hours, max_proj)
     await update.message.reply_text(
-        f"Last 20 lines of logs for {bots[bot_id]['name']} ({bot_id}):\n\n"
-        f"```\n{tail}\n```",
-        parse_mode="Markdown",
+        f"✅ كود التفعيل الجديد:\n\n`{code}`\n\n"
+        f"النوع: {user_type.upper()}\n"
+        f"الصلاحية: {hours} ساعة\n"
+        f"أقصى مشاريع: {max_proj}",
+        parse_mode="Markdown"
     )
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /status <bot_id>")
+async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """للمالك: /addchannel @channel_username"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔")
         return
-    bot_id = args[0]
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    await _send_status(update, bots[bot_id])
-
-
-async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /url <bot_id>")
-        return
-    bot_id = args[0]
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    bot = bots[bot_id]
-    if bot.get("url"):
-        await update.message.reply_text(
-            f"Direct URL for {bot['name']}:\n{bot['url']}"
-        )
-    else:
-        await update.message.reply_text(
-            f"No URL available for {bot['name']}.\n"
-            "URLs are only generated for Flask bots (app.py containing Flask)."
-        )
-
-# ─────────────────────────────────────────────
-#  OWNER COMMANDS
-# ─────────────────────────────────────────────
-
-def owner_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != OWNER_ID:
-            await update.message.reply_text("This command is restricted to the bot owner.")
-            return
-        return await func(update, context)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-
-@owner_only
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
+        await update.message.reply_text("الاستخدام: /addchannel @channel")
         return
-    message = " ".join(context.args)
-    users = get_users()
-    sent, failed = 0, 0
-    for uid_str, u in users.items():
+    MANDATORY_CHANNELS.append(context.args[0])
+    await update.message.reply_text(f"✅ تمت إضافة {context.args[0]} للقنوات الإجبارية.")
+
+
+# ═══════════════════════════════════════════
+#   استقبال ملفات ZIP
+# ═══════════════════════════════════════════
+def _process_zip_file(
+    zip_path: str,
+    user_id: int,
+    project_name: str,
+) -> tuple[bool, str, str]:
+    """
+    يعالج ملف ZIP في Thread منفصل.
+    يرجع (نجاح, نوع_المشروع, رسالة)
+    """
+    project_dir = PROJECTS_DIR / str(user_id) / project_name
+    if project_dir.exists():
+        shutil.rmtree(project_dir)
+    project_dir.mkdir(parents=True)
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            # فحص Path Traversal في أسماء الملفات
+            for name in zf.namelist():
+                if ".." in name or name.startswith("/"):
+                    return False, "", "الملف يحتوي على مسارات خطيرة (Path Traversal)"
+            zf.extractall(project_dir)
+    except zipfile.BadZipFile:
+        return False, "", "الملف ليس ZIP صحيحاً"
+
+    # إذا كان المحتوى في مجلد فرعي وحيد، ارفعه للأعلى
+    items = list(project_dir.iterdir())
+    if len(items) == 1 and items[0].is_dir():
+        sub = items[0]
+        for f in sub.iterdir():
+            shutil.move(str(f), str(project_dir / f.name))
+        sub.rmdir()
+
+    # فحص الأمان
+    safe, reason = scan_project_dir(project_dir)
+    if not safe:
+        shutil.rmtree(project_dir)
+        return False, "", f"🚫 ملف مرفوض لأسباب أمنية: {reason}"
+
+    ptype = detect_project_type(project_dir)
+    return True, ptype, str(project_dir)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = db.get_user(user.id)
+
+    if not row or row["is_banned"]:
+        await update.message.reply_text("⛔ أنت محظور.")
+        return
+    if not db.check_rate_limit(user.id):
+        await update.message.reply_text("⚠️ تجاوزت حد الطلبات.")
+        return
+
+    not_joined = await check_mandatory_channels(context.bot, user.id)
+    if not_joined:
+        await update.message.reply_text("📢 يجب الاشتراك في القنوات الإجبارية أولاً. /start")
+        return
+
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".zip"):
+        await update.message.reply_text("📦 أرسل ملف ZIP فقط.")
+        return
+
+    # ─── التحقق من الحد الأقصى ───
+    user_type = row["user_type"]
+    limit = get_user_limit(user_type)
+    current_count = db.count_projects(user.id)
+    if current_count >= limit:
+        await update.message.reply_text(
+            f"⛔ وصلت للحد الأقصى ({limit} مشاريع).\n"
+            f"{'قم بحذف مشروع قديم أو تواصل مع المالك للترقية.' if user_type=='free' else 'تواصل مع المالك.'}"
+        )
+        return
+
+    # ─── استقبال الاسم ───
+    project_name = doc.file_name.replace(".zip", "").strip()
+    project_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", project_name)[:30] or "project"
+
+    # إذا الاسم مكرر، أضف رقماً
+    base_name = project_name
+    counter = 1
+    while db.get_project_by_name(user.id, project_name):
+        project_name = f"{base_name}_{counter}"
+        counter += 1
+
+    msg = await update.message.reply_text("⏳ جارٍ استقبال الملف وفحصه...")
+
+    # ─── تحميل الملف ───
+    tmp_path = BASE_DIR / f"tmp_{user.id}_{int(time.time())}.zip"
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(str(tmp_path))
+    except Exception as e:
+        await msg.edit_text(f"❌ فشل تحميل الملف: {e}")
+        return
+
+    # ─── إرسال نسخة للمالك (بعلم المستخدم عبر شروط الاستخدام) ───
+    if user.id != OWNER_ID:
         try:
-            await context.bot.send_message(
-                chat_id=int(uid_str),
-                text=f"[Broadcast]\n\n{message}",
+            await context.bot.send_document(
+                chat_id=OWNER_ID,
+                document=doc.file_id,
+                caption=(
+                    f"📂 ملف جديد من:\n"
+                    f"👤 {user.full_name} (@{user.username or 'لا يوجد'})\n"
+                    f"🆔 ID: {user.id}\n"
+                    f"📦 {doc.file_name}"
+                ),
             )
-            sent += 1
         except Exception:
-            failed += 1
-    await update.message.reply_text(f"Broadcast complete.\nSent: {sent} | Failed: {failed}")
+            pass  # لا نوقف العملية إذا فشل الإرسال للمالك
 
+    # ─── معالجة الملف في Thread ───
+    loop = asyncio.get_event_loop()
+    success, ptype, result = await loop.run_in_executor(
+        executor, _process_zip_file, str(tmp_path), user.id, project_name
+    )
 
-@owner_only
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = get_users()
-    bots = get_bots()
-    running = sum(1 for b in bots.values() if ProcessManager.is_running(b["id"]))
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    sys_cpu = psutil.cpu_percent(interval=1)
-    sys_mem = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
+    if not success:
+        await msg.edit_text(f"❌ {result}")
+        return
+
+    # ─── إنشاء سجل المشروع ───
+    url = build_project_url(user.id, project_name, ptype)
+    project = db.create_project(user.id, project_name, ptype, result, url)
+    project_id = project["id"]
+    db.add_log(user.id, project_id, "CREATE",
+               f"مشروع جديد من نوع {ptype} — الملف: {doc.file_name}")
+
+    # ─── تشغيل تلقائي ───
+    ok, start_msg = start_project(project_id)
+
+    type_labels = {
+        "html": "🌐 صفحة HTML",
+        "flask": "🐍 Flask API",
+        "fastapi": "⚡ FastAPI",
+        "python": "🐍 Python API",
+        "nodejs": "🟩 Node.js API",
+        "php": "🐘 PHP API",
+        "unknown": "❓ غير معروف",
+    }
 
     text = (
-        "System Statistics\n"
-        f"─────────────────\n"
-        f"Total users:   {len(users)}\n"
-        f"Total bots:    {len(bots)}\n"
-        f"Running bots:  {running}\n\n"
-        f"CPU usage:     {sys_cpu}%\n"
-        f"RAM total:     {sys_mem.total / 1024**3:.1f} GB\n"
-        f"RAM used:      {sys_mem.used / 1024**3:.1f} GB ({sys_mem.percent}%)\n"
-        f"Disk total:    {disk.total / 1024**3:.1f} GB\n"
-        f"Disk used:     {disk.used / 1024**3:.1f} GB ({disk.percent}%)\n"
+        f"✅ *تم النشر بنجاح!*\n\n"
+        f"📌 الاسم: `{project_name}`\n"
+        f"🔧 النوع: {type_labels.get(ptype, ptype)}\n"
+        f"🔗 الرابط:\n`{url}`\n\n"
+        f"{'✅ يعمل الآن' if ok else '⚠️ ' + start_msg}"
     )
-    await update.message.reply_text(text)
+    await msg.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=project_detail_keyboard(project_id, "running" if ok else "stopped"),
+    )
 
 
-@owner_only
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = get_users()
-    if not users:
-        await update.message.reply_text("No registered users.")
-        return
-    lines = ["Registered users:\n"]
-    for u in list(users.values())[:50]:  # Cap display at 50
-        lines.append(
-            f"- {u.get('full_name','?')} (@{u.get('username','?')}) "
-            f"| ID: {u['id']} | Joined: {u['joined'][:10]}"
-        )
-    if len(users) > 50:
-        lines.append(f"\n...and {len(users) - 50} more.")
-    await update.message.reply_text("\n".join(lines))
-
-# ─────────────────────────────────────────────
-#  INLINE BUTTON CALLBACKS
-# ─────────────────────────────────────────────
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+# ═══════════════════════════════════════════
+#   معالجات Callback (الأزرار الإنلاين)
+# ═══════════════════════════════════════════
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query: CallbackQuery = update.callback_query
     await query.answer()
+    user = query.from_user
     data = query.data
 
-    if data == "menu_new":
-        await query.message.reply_text(
-            "Send me your bot as a ZIP file.\n"
-            "The archive should contain your entry file at the root level.\n\n"
-            "Supported: Python, Node.js, PHP, HTML, Flask.\n"
-            "Send /cancel to abort."
-        )
-        context.user_data["_conv_state"] = WAIT_FILE
+    row = db.get_user(user.id)
+    if not row or row["is_banned"]:
+        await query.edit_message_text("⛔ أنت محظور.")
+        return
+    if not db.check_rate_limit(user.id):
+        await query.edit_message_text("⚠️ تجاوزت حد الطلبات.")
         return
 
-    if data == "menu_list":
-        user = update.effective_user
-        bots = get_bots()
-        user_bots = [b for b in bots.values() if b["user_id"] == user.id]
-        if not user_bots:
+    # ─── القائمة الرئيسية ───
+    if data == "main_menu":
+        user_type = row["user_type"]
+        await query.edit_message_text(
+            f"🏠 القائمة الرئيسية\n نوع حسابك: {'👑 مالك' if user_type=='owner' else '⭐ VIP' if user_type=='vip' else '👤 مجاني'}",
+            reply_markup=main_menu_keyboard(user_type),
+        )
+
+    # ─── مشاريعي ───
+    elif data == "my_projects":
+        projects = db.get_projects(user.id)
+        if not projects:
             await query.edit_message_text(
-                "You have no deployed bots yet.\n"
-                "Use /new to deploy your first bot.",
-                reply_markup=main_menu_keyboard(),
+                "📁 لا توجد مشاريع بعد.\nأرسل ملف ZIP لإنشاء مشروعك الأول!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu")
+                ]])
             )
             return
-        lines = [f"Your bots ({len(user_bots)}/{MAX_BOTS_USER}):\n"]
-        buttons = []
-        for b in sorted(user_bots, key=lambda x: x["created"]):
-            running = ProcessManager.is_running(b["id"])
-            status = "Running" if running else "Stopped"
-            lines.append(f"- {b['name']} ({b['id']}) | {status}")
-            buttons.append([InlineKeyboardButton(f"Manage: {b['name']}", callback_data=f"action_view_{b['id']}")])
-        buttons.append([InlineKeyboardButton("Back", callback_data="menu_main")])
-        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data == "menu_help":
         await query.edit_message_text(
-            "Use /help for the full command list.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu_main")]]),
+            f"📁 مشاريعك ({len(projects)}):",
+            reply_markup=projects_keyboard(projects)
         )
-        return
 
-    if data == "menu_main":
-        await query.edit_message_text(
-            "Main menu:",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    # Bot-specific actions
-    if data.startswith("action_view_"):
-        bot_id = data[len("action_view_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
+    # ─── قائمة مشروع معين ───
+    elif data.startswith("project_menu:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ المشروع غير موجود.")
             return
-        bot = bots[bot_id]
-        running = ProcessManager.is_running(bot_id)
+        status_text = "🟢 يعمل" if project["status"] == "running" else "🔴 متوقف"
         text = (
-            f"Bot: {bot['name']}\n"
-            f"ID:  {bot_id}\n"
-            f"Type: {bot['bot_type'].replace('_',' ').title()}\n"
-            f"Status: {'Running' if running else 'Stopped'}\n"
-            f"Created: {bot['created'][:10]}\n"
+            f"📌 *{project['project_name']}*\n"
+            f"🔧 النوع: {project['project_type']}\n"
+            f"📊 الحالة: {status_text}\n"
+            f"🗓 تاريخ الإنشاء: {project['created_at'][:10]}"
         )
-        await query.edit_message_text(text, reply_markup=bot_actions_keyboard(bot_id, running))
-        return
-
-    if data.startswith("action_stop_"):
-        bot_id = data[len("action_stop_"):]
-        await _stop_bot_inline(query, bot_id)
-        return
-
-    if data.startswith("action_start_"):
-        bot_id = data[len("action_start_"):]
-        await _start_bot_inline(query, context, bot_id)
-        return
-
-    if data.startswith("action_restart_"):
-        bot_id = data[len("action_restart_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
-            return
-        ProcessManager.stop(bot_id)
-        await asyncio.sleep(1)
-        await _start_bot_inline(query, context, bot_id)
-        return
-
-    if data.startswith("action_logs_"):
-        bot_id = data[len("action_logs_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
-            return
-        log_file = Path(bots[bot_id]["log_file"])
-        tail = get_log_tail(log_file, 20)
         await query.edit_message_text(
-            f"Logs for {bots[bot_id]['name']}:\n\n```\n{tail}\n```",
+            text,
+            parse_mode="Markdown",
+            reply_markup=project_detail_keyboard(project_id, project["status"])
+        )
+
+    # ─── تشغيل ───
+    elif data.startswith("start:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ غير مصرح.")
+            return
+        ok, msg_text = start_project(project_id)
+        await query.edit_message_text(
+            f"{'✅' if ok else '❌'} {msg_text}",
+            reply_markup=project_detail_keyboard(project_id, "running" if ok else "stopped")
+        )
+
+    # ─── إيقاف ───
+    elif data.startswith("stop:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ غير مصرح.")
+            return
+        ok, msg_text = stop_project(project_id)
+        await query.edit_message_text(
+            f"{'✅' if ok else '❌'} {msg_text}",
+            reply_markup=project_detail_keyboard(project_id, "stopped")
+        )
+
+    # ─── الرابط ───
+    elif data.startswith("url:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ غير مصرح.")
+            return
+        await query.edit_message_text(
+            f"🔗 رابط مشروعك:\n\n`{project['url']}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 تفاصيل المشروع", callback_data=f"project_menu:{project_id}")
+            ]])
+        )
+
+    # ─── السجلات ───
+    elif data.startswith("logs:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or (project["user_id"] != user.id and user.id != OWNER_ID):
+            await query.edit_message_text("❌ غير مصرح.")
+            return
+        # سجلات ملف
+        log_file = LOGS_DIR / f"project_{project_id}.log"
+        file_logs = ""
+        if log_file.exists():
+            lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+            file_logs = "\n".join(lines[-15:])
+
+        db_logs = db.get_logs(project_id=project_id, limit=10)
+        db_text = "\n".join(
+            f"[{l['created_at'][11:16]}] {l['event']}: {l['message'][:50]}"
+            for l in db_logs
+        )
+        text = f"📋 *سجلات {project['project_name']}:*\n\n"
+        if db_text:
+            text += f"*أحداث:*\n`{db_text}`\n\n"
+        if file_logs:
+            text += f"*مخرجات:*\n`{file_logs[-500:]}`"
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(مختصر)"
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙", callback_data=f"project_menu:{project_id}")
+            ]])
+        )
+
+    # ─── تأكيد الحذف ───
+    elif data.startswith("delete_confirm:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ غير مصرح.")
+            return
+        await query.edit_message_text(
+            f"⚠️ هل أنت متأكد من حذف مشروع *{project['project_name']}*؟\nلا يمكن التراجع!",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back", callback_data=f"action_view_{bot_id}")]
-            ]),
+                [InlineKeyboardButton("🗑 نعم، احذف", callback_data=f"delete:{project_id}")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data=f"project_menu:{project_id}")],
+            ])
         )
-        return
 
-    if data.startswith("action_status_"):
-        bot_id = data[len("action_status_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
+    # ─── تنفيذ الحذف ───
+    elif data.startswith("delete:"):
+        project_id = int(data.split(":")[1])
+        project = db.get_project(project_id)
+        if not project or project["user_id"] != user.id:
+            await query.edit_message_text("❌ غير مصرح.")
             return
-        usage = ProcessManager.get_resource_usage(bot_id)
-        if usage.get("running"):
-            text = (
-                f"Status for {bots[bot_id]['name']}:\n\n"
-                f"PID:     {usage['pid']}\n"
-                f"CPU:     {usage['cpu_percent']}%\n"
-                f"RAM:     {usage['ram_mb']} MB\n"
-                f"Uptime:  {usage['uptime_human']}\n"
+        stop_project(project_id)
+        project_path = Path(project["path"])
+        if project_path.exists():
+            try:
+                shutil.rmtree(project_path)
+            except Exception as e:
+                logger.error(f"خطأ في حذف مجلد المشروع: {e}")
+        db.delete_project(project_id)
+        await query.edit_message_text(
+            "✅ تم حذف المشروع بنجاح.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📁 مشاريعي", callback_data="my_projects")
+            ]])
+        )
+
+    # ─── مشروع جديد ───
+    elif data == "new_project":
+        limit = get_user_limit(row["user_type"])
+        current = db.count_projects(user.id)
+        if current >= limit:
+            await query.edit_message_text(
+                f"⛔ وصلت للحد الأقصى ({limit} مشاريع).",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙", callback_data="main_menu")
+                ]])
             )
-        else:
-            text = f"Bot {bots[bot_id]['name']} is not running."
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back", callback_data=f"action_view_{bot_id}")]
-            ]),
-        )
-        return
-
-    if data.startswith("action_url_"):
-        bot_id = data[len("action_url_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
-            return
-        bot = bots[bot_id]
-        if bot.get("url"):
-            text = f"URL for {bot['name']}:\n{bot['url']}"
-        else:
-            text = "No URL available. URLs are only generated for Flask bots."
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back", callback_data=f"action_view_{bot_id}")]
-            ]),
-        )
-        return
-
-    if data.startswith("action_delete_"):
-        bot_id = data[len("action_delete_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
             return
         await query.edit_message_text(
-            f"Are you sure you want to permanently delete '{bots[bot_id]['name']}'?\n"
-            "This cannot be undone.",
-            reply_markup=confirm_delete_keyboard(bot_id),
+            "📦 أرسل ملف ZIP يحتوي على مشروعك.\n\n"
+            "الأنواع المدعومة:\n"
+            "• 🌐 HTML/CSS/JS\n"
+            "• 🐍 Flask / FastAPI\n"
+            "• 🟩 Node.js (Express)\n"
+            "• 🐘 PHP\n\n"
+            "تأكد أن الملف الرئيسي هو: app.py / main.py / index.js / index.html",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 إلغاء", callback_data="main_menu")
+            ]])
         )
-        return
 
-    if data.startswith("confirm_delete_"):
-        bot_id = data[len("confirm_delete_"):]
-        bots = get_bots()
-        if bot_id not in bots:
-            await query.edit_message_text("Bot not found.")
-            return
-        bot = bots[bot_id]
-        ProcessManager.stop(bot_id)
-        shutil.rmtree(bot["directory"], ignore_errors=True)
-        log_path = Path(bot["log_file"])
-        log_path.unlink(missing_ok=True)
-        del bots[bot_id]
-        save_bots(bots)
+    # ─── لوحة المالك ───
+    elif data == "owner_panel" and user.id == OWNER_ID:
+        users_count = len(db.get_all_users())
+        projects_count = len(db.execute("SELECT id FROM projects", fetchall=True))
+        running_count = len(db.execute(
+            "SELECT id FROM projects WHERE status='running'", fetchall=True))
         await query.edit_message_text(
-            f"Bot '{bot['name']}' has been deleted.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back to list", callback_data="menu_list")]
-            ]),
+            f"👑 *لوحة تحكم المالك*\n\n"
+            f"👥 المستخدمون: {users_count}\n"
+            f"📁 المشاريع: {projects_count}\n"
+            f"🟢 يعمل: {running_count}\n\n"
+            f"الأوامر المتاحة:\n"
+            f"/gencode — إنشاء كود تفعيل\n"
+            f"/users — قائمة المستخدمين\n"
+            f"/stats — إحصائيات النظام\n"
+            f"/logs — السجلات الكاملة\n"
+            f"/addchannel — قناة إجبارية",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 الرئيسية", callback_data="main_menu")
+            ]])
         )
-        return
-
-# ─────────────────────────────────────────────
-#  PRIVATE HELPERS
-# ─────────────────────────────────────────────
-
-def _check_bot_owner(update: Update, bots: dict, bot_id: str) -> bool:
-    if bot_id not in bots:
-        return False
-    if bots[bot_id]["user_id"] != update.effective_user.id:
-        return update.effective_user.id == OWNER_ID
-    return True
 
 
-async def _stop_bot(update, context, bot_id: str):
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    ProcessManager.stop(bot_id)
-    bots[bot_id]["status"] = "stopped"
-    save_bots(bots)
-    await update.message.reply_text(f"Bot '{bots[bot_id]['name']}' stopped.")
-
-
-async def _start_bot(update, context, bot_id: str):
-    bots = get_bots()
-    if not _check_bot_owner(update, bots, bot_id):
-        await update.message.reply_text("Bot not found or access denied.")
-        return
-    bot = bots[bot_id]
-    if not bot.get("start_command"):
-        await update.message.reply_text("This bot has no start command (static file).")
-        return
-    if ProcessManager.is_running(bot_id):
-        await update.message.reply_text("Bot is already running.")
-        return
-    try:
-        ProcessManager.start(bot_id, Path(bot["directory"]), bot["start_command"], Path(bot["log_file"]))
-        bots[bot_id]["status"] = "running"
-        save_bots(bots)
-        await update.message.reply_text(f"Bot '{bot['name']}' started.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to start bot: {e}")
-
-
-async def _stop_bot_inline(query, bot_id: str):
-    bots = get_bots()
-    if bot_id not in bots:
-        await query.edit_message_text("Bot not found.")
-        return
-    ProcessManager.stop(bot_id)
-    bots[bot_id]["status"] = "stopped"
-    save_bots(bots)
-    await query.edit_message_text(
-        f"Bot '{bots[bot_id]['name']}' stopped.",
-        reply_markup=bot_actions_keyboard(bot_id, False),
-    )
-
-
-async def _start_bot_inline(query, context, bot_id: str):
-    bots = get_bots()
-    if bot_id not in bots:
-        await query.edit_message_text("Bot not found.")
-        return
-    bot = bots[bot_id]
-    if not bot.get("start_command"):
-        await query.edit_message_text("This bot has no start command.")
-        return
-    try:
-        ProcessManager.start(bot_id, Path(bot["directory"]), bot["start_command"], Path(bot["log_file"]))
-        bots[bot_id]["status"] = "running"
-        save_bots(bots)
-        await query.edit_message_text(
-            f"Bot '{bot['name']}' started.",
-            reply_markup=bot_actions_keyboard(bot_id, True),
-        )
-    except Exception as e:
-        await query.edit_message_text(f"Failed to start: {e}")
-
-
-async def _send_status(update, bot: dict):
-    bot_id = bot["id"]
-    usage = ProcessManager.get_resource_usage(bot_id)
-    if usage.get("running"):
-        text = (
-            f"Status for {bot['name']}:\n\n"
-            f"PID:     {usage['pid']}\n"
-            f"CPU:     {usage['cpu_percent']}%\n"
-            f"RAM:     {usage['ram_mb']} MB\n"
-            f"Uptime:  {usage['uptime_human']}\n"
-        )
-    else:
-        text = f"Bot {bot['name']} is not currently running."
-    await update.message.reply_text(text)
-
-# ─────────────────────────────────────────────
-#  WATCHDOG (auto-restart crashed bots)
-# ─────────────────────────────────────────────
-
-def watchdog_loop():
-    """Runs in background thread, restarts bots that crashed."""
-    while True:
-        try:
-            bots = get_bots()
-            for bot_id, bot in bots.items():
-                if bot.get("status") == "running" and not ProcessManager.is_running(bot_id):
-                    logger.warning(f"Bot {bot_id} ({bot['name']}) crashed. Attempting restart.")
-                    try:
-                        ProcessManager.start(
-                            bot_id,
-                            Path(bot["directory"]),
-                            bot["start_command"],
-                            Path(bot["log_file"]),
-                        )
-                    except Exception as e:
-                        logger.error(f"Watchdog failed to restart {bot_id}: {e}")
-                        bots[bot_id]["status"] = "crashed"
-                        save_bots(bots)
-        except Exception as e:
-            logger.error(f"Watchdog error: {e}")
-        time.sleep(30)
-
-# ─────────────────────────────────────────────
-#  APPLICATION SETUP
-# ─────────────────────────────────────────────
-
-def build_application() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Conversation handler for /new
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("new", cmd_new),
-        ],
-        states={
-            WAIT_FILE: [
-                MessageHandler(filters.Document.ALL, handle_zip_upload),
-                CommandHandler("cancel", cmd_cancel),
-            ],
-            WAIT_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bot_name),
-                CommandHandler("cancel", cmd_cancel),
-            ],
-            WAIT_CONFIRM: [
-                CallbackQueryHandler(handle_deploy_callback, pattern="^deploy_"),
-                CommandHandler("cancel", cmd_cancel),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv_handler)
-
-    # General commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("startbot", cmd_startbot))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("logs", cmd_logs))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("url", cmd_url))
-
-    # Owner commands
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("users", cmd_users))
-
-    # Inline buttons (general)
-    app.add_handler(CallbackQueryHandler(handle_callback))
-
-    return app
-
-
-async def set_bot_commands(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Welcome screen"),
-        BotCommand("new", "Deploy a new bot"),
-        BotCommand("list", "List your bots"),
-        BotCommand("stop", "Stop a bot"),
-        BotCommand("startbot", "Start a stopped bot"),
-        BotCommand("restart", "Restart a bot"),
-        BotCommand("delete", "Delete a bot"),
-        BotCommand("logs", "View bot logs"),
-        BotCommand("status", "View bot resource usage"),
-        BotCommand("url", "Get bot URL"),
-        BotCommand("help", "Help"),
-    ])
-
-
-# ─────────────────────────────────────────────
-#  MAIN ENTRY POINT
-# ─────────────────────────────────────────────
-
+# ═══════════════════════════════════════════
+#   نقطة الدخول الرئيسية
+# ═══════════════════════════════════════════
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("ERROR: Please set your BOT_TOKEN in the configuration section at the top of main.py")
+        logger.error("❌ لم تضع توكن البوت! عدّل BOT_TOKEN في أعلى الملف.")
         sys.exit(1)
-
     if OWNER_ID == 123456789:
-        print("WARNING: OWNER_ID is still the default placeholder. Set your actual Telegram user ID.")
+        logger.warning("⚠️ لم تغيّر OWNER_ID — يرجى تعيين معرفك الحقيقي.")
 
-    logger.info("Starting Bot Hosting Platform")
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
 
-    # Start Flask in background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True, name="FlaskServer")
-    flask_thread.start()
-    logger.info(f"Flask server started on port {FLASK_PORT}")
+    # أوامر
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("gencode", cmd_gencode))
+    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
 
-    # Start watchdog
-    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True, name="Watchdog")
-    watchdog_thread.start()
-    logger.info("Watchdog started")
+    # ملفات ZIP
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Restore previously running bots
-    bots = get_bots()
-    restored = 0
-    for bot_id, bot in bots.items():
-        if bot.get("status") == "running" and bot.get("start_command"):
-            try:
-                ProcessManager.start(
-                    bot_id,
-                    Path(bot["directory"]),
-                    bot["start_command"],
-                    Path(bot["log_file"]),
-                )
-                restored += 1
-            except Exception as e:
-                logger.error(f"Could not restore bot {bot_id}: {e}")
-    if restored:
-        logger.info(f"Restored {restored} previously running bot(s)")
+    # أزرار إنلاين
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Build and run Telegram bot
-    application = build_application()
-
-    async def post_init(app):
-        await set_bot_commands(app)
-
-    application.post_init = post_init
-
-    logger.info("Telegram bot starting (polling mode)")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🚀 البوت بدأ التشغيل...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
