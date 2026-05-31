@@ -44,7 +44,7 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 BOT_TOKEN      = "8791101593:AAEbW3M77kiiL5NghFICpl0iDInpVKh0VwY"          # BotFather token
 OWNER_ID       = 8487397448                       # Your Telegram user ID (int)
-SERVER_HOST    = "http://your-server.com"        # Public URL of this machine
+SERVER_HOST    = "https://host-masjon.onrender.com"        # Public URL of this machine
 FLASK_PORT     = 5000
 FLASK_HOST     = "0.0.0.0"
 
