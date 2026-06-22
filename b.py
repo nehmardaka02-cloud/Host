@@ -93,6 +93,24 @@ logger = logging.getLogger("BotHost")
 WAIT_FILE, WAIT_NAME, WAIT_CONFIRM = range(3)
 
 # ─────────────────────────────────────────────
+#  CONFLICT RESOLUTION
+# ─────────────────────────────────────────────
+
+async def clear_bot_conflicts():
+    """Clear pending updates and webhook before polling starts"""
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.bot.get_updates(offset=-1, limit=100)
+        logger.info("✅ Bot conflicts cleared successfully")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not clear conflicts: {e}")
+
+def run_conflict_clear():
+    """Synchronous wrapper for async conflict clearing"""
+    asyncio.run(clear_bot_conflicts())
+
+# ─────────────────────────────────────────────
 #  DATA HELPERS
 # ─────────────────────────────────────────────
 
@@ -1287,6 +1305,11 @@ def main():
     if OWNER_ID == 123456789:
         print("WARNING: OWNER_ID is still the default placeholder. Set your actual Telegram user ID.")
 
+    # 🔥 CRITICAL FIX: Clear conflicts before starting
+    logger.info("Clearing previous bot conflicts...")
+    run_conflict_clear()
+    logger.info("Bot conflicts cleared successfully")
+
     logger.info("Starting Bot Hosting Platform")
 
     # Start Flask in background thread
@@ -1326,7 +1349,12 @@ def main():
     application.post_init = post_init
 
     logger.info("Telegram bot starting (polling mode)")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # 🔥 CRITICAL FIX: Use drop_pending_updates=True
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
